@@ -54,7 +54,7 @@ jobs:
       - name: AI Remediation
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OLLAMA_MODEL: "gemma4:e2b"
+          OLLAMA_MODEL: "qwen2.5-coder:1.5b"
         run: |
           set +e
 
