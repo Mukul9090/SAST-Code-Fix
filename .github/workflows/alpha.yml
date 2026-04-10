@@ -108,7 +108,7 @@ jobs:
                   out.write(f"Lines: {start_line}-{end_line}\n")
                   out.write(f"Message: {message}\n\n")
                   out.write(f"Vulnerable Code:\n{lines}\n\n")
-                  out.write(f"Full File Content:\n{full_file}")
+                  out.write(f"Fix only the vulnerable lines shown above.")
 
               with open(f'/tmp/findings/finding_{count}.meta', 'w') as meta:
                   json.dump({
