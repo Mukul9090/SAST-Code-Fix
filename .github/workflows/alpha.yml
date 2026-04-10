@@ -1,7 +1,3 @@
-"""
-Vulnerable App — Test File
-3 vulnerabilities for AI remediation testing
-"""
 
 import sqlite3
 import subprocess
