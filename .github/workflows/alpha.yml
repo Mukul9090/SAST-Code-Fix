@@ -1,7 +1,7 @@
 name: Token Permission Check
 
 on: workflow_dispatch
-
+ 
 jobs:
   check-token:
     runs-on: self-hosted
