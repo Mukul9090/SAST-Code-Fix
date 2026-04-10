@@ -1,41 +1,55 @@
-name: Token Permission Check
+name: AI Security Remediation
 
-on: workflow_dispatch
- 
+on: 
+  push:
+    branches: [ "main" ] # This triggers the workflow on every commit to main
+
 jobs:
-  check-token:
+  security-fix:
     runs-on: self-hosted
-    env:
-      # Replace this with your actual PAT for the test
-      MY_TOKEN: "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"
     steps:
-      - name: Query GitHub API for Token Scopes
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Ensures we have history to branch and push
+
+      - name: Start Ollama
         run: |
-          echo "════════════════════════════════════════════════"
-          echo "   TOKEN DIAGNOSTIC REPORT"
-          echo "════════════════════════════════════════════════"
-          
-          # Call the API and capture headers to see scopes
-          RESPONSE=$(curl -sI -H "Authorization: token $MY_TOKEN" https://api.github.com/user)
-          
-          # Check if the token is even valid
-          HTTP_STATUS=$(echo "$RESPONSE" | grep "HTTP/" | awk '{print $2}')
-          
-          if [ "$HTTP_STATUS" != "200" ]; then
-            echo "✘ ERROR: Token is INVALID or EXPIRED (Status: $HTTP_STATUS)"
-            exit 1
-          fi
+          pkill ollama || true
+          ollama serve &
+          sleep 5
+          ollama pull qwen2.5-coder:3b
 
-          # Extract the X-OAuth-Scopes header
-          SCOPES=$(echo "$RESPONSE" | grep -i "x-oauth-scopes" | cut -d':' -f2 | xargs)
-          
-          echo "✔ Token is VALID"
-          echo "▸ Active Scopes: [ $SCOPES ]"
-          echo ""
+      - name: AI Remediation & Authenticated Push
+        env:
+          GITHUB_TOKEN: "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"
+        run: |
+          # 1. Diagnostic: Check if token is valid (Optional but helpful)
+          curl -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/user -I | grep "x-oauth-scopes"
 
-          if [[ $SCOPES == *"repo"* ]]; then
-            echo "✔ PERMISSION CHECK: 'repo' scope found. You HAVE push access."
-          else
-            echo "✘ PERMISSION CHECK: 'repo' scope MISSING. You cannot push code."
-          fi
-          echo "════════════════════════════════════════════════"
+          # 2. Configure Git Identity
+          git config user.name "AI Security Bot"
+          git config user.email "security-bot@automated.fix"
+
+          # 3. Create a unique branch name
+          BRANCH_NAME="ai-security-fix-$(date +%s)"
+          git checkout -b "$BRANCH_NAME"
+
+          # --- [ Insert your AI logic here to modify files ] ---
+          # (For demonstration, we'll assume files were modified by your script)
+          
+          # 4. THE CRITICAL FIX: Set the remote URL to include the token
+          # This overrides the "Permission Denied" bot error
+          AUTH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/Mukul9090/SAST-Code-Fix.git"
+          git remote set-url origin "$AUTH_URL"
+
+          # 5. Push the new branch
+          git add .
+          git commit -m "fix: AI remediation of SAST findings" || echo "No changes to commit"
+          git push origin "$BRANCH_NAME" --force
+
+          # 6. Create PR using the API
+          curl -X POST \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/Mukul9090/SAST-Code-Fix/pulls \
+            -d "{\"title\":\"🔒 AI Security Patch\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"This PR fixes vulnerabilities found in the latest commit.\"}"
