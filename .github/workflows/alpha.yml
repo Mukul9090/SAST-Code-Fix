@@ -63,14 +63,14 @@ jobs:
           echo "✔ Ollama server ready"
 
           # Pull the model
-          ollama pull qwen2.5-coder:7b
+          ollama pull gemma4:e2b
           echo "✔ Model pulled"
 
       # ── AI Triage & Fix MR Creation ──────────────────────
       - name: AI Remediation
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OLLAMA_MODEL: "qwen2.5-coder:7b"
+          OLLAMA_MODEL: "gemma4:e2b"
         run: |
           echo "════════════════════════════════════════════════"
           echo "  AI SECURITY REMEDIATION"
