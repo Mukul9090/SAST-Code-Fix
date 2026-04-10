@@ -2,54 +2,119 @@ name: AI Security Remediation
 
 on: 
   push:
-    branches: [ "main" ] # This triggers the workflow on every commit to main
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
-  security-fix:
+  security-remediation:
     runs-on: self-hosted
+    env:
+      # CRITICAL: Replace this with your NEW token. 
+      # The old one was likely revoked because it was visible in logs.
+      GITHUB_TOKEN: "YOUR_NEW_GITHUB_TOKEN_HERE"
+      OLLAMA_MODEL: "qwen2.5-coder:3b"
+
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Ensures we have history to branch and push
+          fetch-depth: 0
+
+      - name: Run Semgrep Scan
+        run: |
+          pip install semgrep || pip install semgrep --break-system-packages
+          semgrep --config auto --json --output semgrep-results.json . || true
+          echo "✔ Semgrep scan complete"
 
       - name: Start Ollama
         run: |
           pkill ollama || true
+          sleep 2
           ollama serve &
           sleep 5
-          ollama pull qwen2.5-coder:3b
+          ollama pull $OLLAMA_MODEL
+          echo "✔ Model ready"
 
-      - name: AI Remediation & Authenticated Push
-        env:
-          GITHUB_TOKEN: "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"
+      - name: AI Remediation & Push
         run: |
-          # 1. Diagnostic: Check if token is valid (Optional but helpful)
-          curl -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/user -I | grep "x-oauth-scopes"
+          set +e
+          if [ ! -f semgrep-results.json ] || [ ! -s semgrep-results.json ]; then
+            echo "No vulnerabilities found."
+            exit 0
+          fi
 
-          # 2. Configure Git Identity
+          # 1. Deduplicate findings using Python
+          python3 << 'PYEOF'
+          import json, os
+          os.makedirs('/tmp/findings', exist_ok=True)
+          with open('semgrep-results.json') as f:
+              data = json.load(f)
+          results = data.get('results', [])
+          seen = set()
+          count = 0
+          for r in results:
+              file_path = r.get('path', '')
+              start_line = r.get('start', {}).get('line', 0)
+              end_line = r.get('end', {}).get('line', 0)
+              lines = r.get('extra', {}).get('lines', '')
+              check_id = r.get('check_id', '').split('.')[-1]
+              key = f"{file_path}:{start_line}"
+              if key in seen: continue
+              seen.add(key)
+              with open(f'/tmp/findings/f_{count}.meta', 'w') as m:
+                  json.dump({'file': file_path, 'start': start_line, 'end': end_line, 'rule': check_id, 'lines': lines}, m)
+              count += 1
+          PYEOF
+
+          # 2. Configure Git
           git config user.name "AI Security Bot"
           git config user.email "security-bot@automated.fix"
-
-          # 3. Create a unique branch name
-          BRANCH_NAME="ai-security-fix-$(date +%s)"
-          git checkout -b "$BRANCH_NAME"
-
-          # --- [ Insert your AI logic here to modify files ] ---
-          # (For demonstration, we'll assume files were modified by your script)
           
-          # 4. THE CRITICAL FIX: Set the remote URL to include the token
-          # This overrides the "Permission Denied" bot error
+          # Force Authenticated Remote
           AUTH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/Mukul9090/SAST-Code-Fix.git"
           git remote set-url origin "$AUTH_URL"
 
-          # 5. Push the new branch
-          git add .
-          git commit -m "fix: AI remediation of SAST findings" || echo "No changes to commit"
-          git push origin "$BRANCH_NAME" --force
+          # 3. Process each finding
+          for META in /tmp/findings/f_*.meta; do
+            [ -f "$META" ] || continue
+            FILE=$(python3 -c "import json; print(json.load(open('$META'))['file'])")
+            RULE=$(python3 -c "import json; print(json.load(open('$META'))['rule'])")
+            LINES=$(python3 -c "import json; print(json.load(open('$META'))['lines'])")
+            
+            BRANCH_NAME="fix/sast-${RULE}-$(date +%s)"
+            git checkout main
+            git checkout -b "$BRANCH_NAME"
 
-          # 6. Create PR using the API
-          curl -X POST \
-            -H "Authorization: token ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/Mukul9090/SAST-Code-Fix/pulls \
-            -d "{\"title\":\"🔒 AI Security Patch\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"This PR fixes vulnerabilities found in the latest commit.\"}"
+            echo "▸ Requesting fix for $RULE in $FILE"
+
+            # Call Ollama
+            FIXED_CODE=$(curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" \
+              -d "{\"model\":\"$OLLAMA_MODEL\",\"messages\":[{\"role\":\"system\",\"content\":\"Fix this vulnerability. Return ONLY code.\"},{\"role\":\"user\",\"content\":\"$LINES\"}],\"stream\":false}" \
+              | python3 -c "import sys, json; print(json.load(sys.stdin).get('message', {}).get('content', '').strip())")
+
+            if [ -z "$FIXED_CODE" ]; then continue; fi
+
+            # Apply fix
+            python3 -c "
+          import json
+          with open('$META') as f: m = json.load(f)
+          with open(m['file']) as f: lines = f.readlines()
+          new_lines = lines[:m['start']-1] + ['$FIXED_CODE' + '\n'] + lines[m['end']:]
+          with open(m['file'], 'w') as f: f.writelines(new_lines)"
+
+            # Push and Create PR
+            git add "$FILE"
+            if git commit -m "fix: $RULE"; then
+               git push origin "$BRANCH_NAME" --force
+               
+               curl -s -X POST \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                https://api.github.com/repos/Mukul9090/SAST-Code-Fix/pulls \
+                -d "{\"title\":\"🔒 AI Fix: $RULE\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"Automated security patch.\"}"
+            fi
+            git checkout main
+          done
+
+      - name: Cleanup
+        if: always()
+        run: pkill ollama || true
