@@ -9,9 +9,7 @@ jobs:
   security-remediation:
     runs-on: self-hosted
     env:
-      # CRITICAL: Replace this with your NEW token. 
-      # The old one was likely revoked because it was visible in logs.
-      GITHUB_TOKEN: "YOUR_NEW_GITHUB_TOKEN_HERE"
+      GITHUB_TOKEN: "YOUR_NEW_GITHUB_TOKEN_HERE" # Ensure this is your fresh token
       OLLAMA_MODEL: "qwen2.5-coder:3b"
 
     steps:
@@ -23,7 +21,6 @@ jobs:
         run: |
           pip install semgrep || pip install semgrep --break-system-packages
           semgrep --config auto --json --output semgrep-results.json . || true
-          echo "✔ Semgrep scan complete"
 
       - name: Start Ollama
         run: |
@@ -32,7 +29,6 @@ jobs:
           ollama serve &
           sleep 5
           ollama pull $OLLAMA_MODEL
-          echo "✔ Model ready"
 
       - name: AI Remediation & Push
         run: |
@@ -42,7 +38,7 @@ jobs:
             exit 0
           fi
 
-          # 1. Deduplicate findings using Python
+          # 1. Deduplicate findings
           python3 << 'PYEOF'
           import json, os
           os.makedirs('/tmp/findings', exist_ok=True)
@@ -68,8 +64,6 @@ jobs:
           # 2. Configure Git
           git config user.name "AI Security Bot"
           git config user.email "security-bot@automated.fix"
-          
-          # Force Authenticated Remote
           AUTH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/Mukul9090/SAST-Code-Fix.git"
           git remote set-url origin "$AUTH_URL"
 
@@ -86,31 +80,46 @@ jobs:
 
             echo "▸ Requesting fix for $RULE in $FILE"
 
-            # Call Ollama
-            FIXED_CODE=$(curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" \
-              -d "{\"model\":\"$OLLAMA_MODEL\",\"messages\":[{\"role\":\"system\",\"content\":\"Fix this vulnerability. Return ONLY code.\"},{\"role\":\"user\",\"content\":\"$LINES\"}],\"stream\":false}" \
-              | python3 -c "import sys, json; print(json.load(sys.stdin).get('message', {}).get('content', '').strip())")
+            # Call Ollama and save to a temporary file instead of a variable
+            curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" \
+              -d "{\"model\":\"$OLLAMA_MODEL\",\"messages\":[{\"role\":\"system\",\"content\":\"Fix this vulnerability. Return ONLY the corrected python code. No explanation. No markdown fences.\"},{\"role\":\"user\",\"content\":\"$LINES\"}],\"stream\":false}" \
+              | python3 -c "import sys, json; print(json.load(sys.stdin).get('message', {}).get('content', '').strip())" > /tmp/ai_fix.txt
 
-            if [ -z "$FIXED_CODE" ]; then continue; fi
+            # Export the fixed code to an environment variable to pass to Python safely
+            export FIXED_CODE_STR=$(cat /tmp/ai_fix.txt)
 
-            # Apply fix
-            python3 -c "
-          import json
-          with open('$META') as f: m = json.load(f)
-          with open(m['file']) as f: lines = f.readlines()
-          new_lines = lines[:m['start']-1] + ['$FIXED_CODE' + '\n'] + lines[m['end']:]
-          with open(m['file'], 'w') as f: f.writelines(new_lines)"
+            # 4. The Fix: Pass the code via ENV to avoid shell quoting issues
+            python3 << 'PYEOF'
+          import json, os
+          fixed_code = os.environ.get('FIXED_CODE_STR', '')
+          meta_file = os.environ.get('META_FILE_PATH', '') # We'll set this below
+          
+          with open(os.environ['CURRENT_META']) as f:
+              m = json.load(f)
+          with open(m['file']) as f:
+              lines = f.readlines()
+          
+          # Clean up any potential markdown fences the AI might have added anyway
+          fixed_code = fixed_code.replace('```python', '').replace('```', '').strip()
+          
+          new_lines = lines[:m['start']-1] + [fixed_code + '\n'] + lines[m['end']:]
+          with open(m['file'], 'w') as f:
+              f.writelines(new_lines)
+          PYEOF
+            env:
+              CURRENT_META: $META
 
-            # Push and Create PR
+            # 5. Push and Create PR
             git add "$FILE"
             if git commit -m "fix: $RULE"; then
                git push origin "$BRANCH_NAME" --force
                
+               PR_BODY="{\"title\":\"🔒 AI Fix: $RULE\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"Automated security patch for $RULE in $FILE.\"}"
                curl -s -X POST \
                 -H "Authorization: token ${GITHUB_TOKEN}" \
                 -H "Accept: application/vnd.github.v3+json" \
                 https://api.github.com/repos/Mukul9090/SAST-Code-Fix/pulls \
-                -d "{\"title\":\"🔒 AI Fix: $RULE\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"Automated security patch.\"}"
+                -d "$PR_BODY"
             fi
             git checkout main
           done
