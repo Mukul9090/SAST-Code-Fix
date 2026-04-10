@@ -48,19 +48,13 @@ jobs:
             sleep 1
           done
           echo "✔ Ollama server ready"
-          ollama pull qwen2.5-coder:1.5b
+          ollama pull qwen2.5-coder:3b
           echo "✔ Model ready"
-
-          echo "▸ Quick test:"
-          curl -sS http://localhost:11434/api/chat \
-            -d '{"model":"qwen2.5-coder:1.5b","messages":[{"role":"user","content":"Say hello"}],"stream":false}' \
-            | python3 -c "import sys,json; print(json.load(sys.stdin)['message']['content'][:100])" 2>/dev/null
-          echo "✔ Model responding"
 
       - name: AI Remediation
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-          OLLAMA_MODEL: "qwen2.5-coder:1.5b"
+          OLLAMA_MODEL: "qwen2.5-coder:3b"
         run: |
           set +e
 
@@ -77,8 +71,7 @@ jobs:
             exit 0
           fi
 
-          # ── Extract findings ─────────────────────────────
-          # Deduplicate by check_id + start_line to avoid 45 findings for 3 vulns
+          # ── Extract & deduplicate findings ───────────────
           python3 << 'PYEOF'
           import json, os
 
@@ -103,20 +96,15 @@ jobs:
               message = r.get('extra', {}).get('message', '')
               lines = r.get('extra', {}).get('lines', '')
 
-              # Deduplicate: same file + same lines = same vuln
-              dedup_key = f"{file_path}:{start_line}:{end_line}"
-              if dedup_key in seen:
+              # Deduplicate by file + line range
+              key = f"{file_path}:{start_line}-{end_line}"
+              if key in seen:
                   continue
-              seen.add(dedup_key)
+              seen.add(key)
 
-              with open(f'/tmp/findings/finding_{count}.txt', 'w') as out:
-                  out.write(f"Rule: {check_id}\n")
-                  out.write(f"Severity: {severity}\n")
-                  out.write(f"File: {file_path}\n")
-                  out.write(f"Lines: {start_line}-{end_line}\n")
-                  out.write(f"Message: {message}\n\n")
-                  out.write(f"Vulnerable Code:\n{lines}\n\n")
-                  out.write(f"Provide the fixed version of ONLY the vulnerable code shown above.")
+              # Write ONLY the snippet, not the full file
+              with open(f'/tmp/findings/finding_{count}.prompt', 'w') as out:
+                  out.write(f"Fix this {check_id.split('.')[-1]} vulnerability:\n\n{lines}")
 
               with open(f'/tmp/findings/finding_{count}.meta', 'w') as meta:
                   json.dump({
@@ -125,19 +113,21 @@ jobs:
                       'end_line': end_line,
                       'severity': severity,
                       'check_id': check_id,
-                      'message': message
+                      'message': message,
+                      'lines': lines
                   }, meta)
 
               count += 1
 
-          print(count)
+          print(f"Deduplicated: {len(results)} raw findings → {count} unique")
           PYEOF
 
-          FINDING_COUNT=$(ls /tmp/findings/finding_*.txt 2>/dev/null | wc -l | tr -d ' ')
-          echo "▸ Found ${FINDING_COUNT} unique CRITICAL/HIGH findings"
+          FINDING_COUNT=$(ls /tmp/findings/finding_*.prompt 2>/dev/null | wc -l | tr -d ' ')
+          echo "▸ Processing ${FINDING_COUNT} unique findings"
+          echo ""
 
           if [ "$FINDING_COUNT" = "0" ]; then
-            echo "✔ No critical/high findings — nothing to remediate"
+            echo "✔ Nothing to remediate"
             exit 0
           fi
 
@@ -150,163 +140,114 @@ jobs:
           FAILED=0
           FIX_PRS=""
 
-          SYSTEM_PROMPT='You are a security engineer. Analyze the vulnerability and respond with ONLY a JSON object. No explanation. No markdown. No backticks. Just JSON: {"is_false_positive": false, "confidence": "HIGH", "reasoning": "Why in 20 words.", "suggested_fix": "How to fix in 15 words.", "fixed_code": "The corrected code lines or null."}'
+          for PROMPT_FILE in /tmp/findings/finding_*.prompt; do
+            [ -f "$PROMPT_FILE" ] || continue
 
-          for FINDING_FILE in /tmp/findings/finding_*.txt; do
-            [ -f "$FINDING_FILE" ] || continue
-
-            IDX=$(basename "$FINDING_FILE" .txt | sed 's/finding_//')
+            IDX=$(basename "$PROMPT_FILE" .prompt | sed 's/finding_//')
             META_FILE="/tmp/findings/finding_${IDX}.meta"
-            RULE=$(head -1 "$FINDING_FILE" | sed 's/Rule: //')
-            FILE_PATH=$(sed -n '3p' "$FINDING_FILE" | sed 's/File: //')
-            SEVERITY=$(sed -n '2p' "$FINDING_FILE" | sed 's/Severity: //')
+
+            RULE=$(python3 -c "import json; print(json.load(open('$META_FILE'))['check_id'])")
+            FILE_PATH=$(python3 -c "import json; print(json.load(open('$META_FILE'))['file'])")
+            SEVERITY=$(python3 -c "import json; print(json.load(open('$META_FILE'))['severity'])")
+            VULN_CODE=$(python3 -c "import json; print(json.load(open('$META_FILE'))['lines'])")
+            SHORT_RULE=$(echo "$RULE" | awk -F'.' '{print $NF}')
 
             TOTAL=$((TOTAL + 1))
-            echo ""
-            echo "  [${TOTAL}/${FINDING_COUNT}] ${SEVERITY} — ${RULE}"
+            echo "  [${TOTAL}/${FINDING_COUNT}] ${SEVERITY} — ${SHORT_RULE}"
             echo "       File: ${FILE_PATH}"
 
-            # ── Build request JSON via Python file ─────────
+            # ── Call Ollama with simple prompt ─────────────
+            PROMPT=$(cat "$PROMPT_FILE")
+
             python3 -c "
-          import json, sys
-          prompt = open(sys.argv[1]).read()
-          system = sys.argv[2]
-          model = sys.argv[3]
+          import json
           req = {
-              'model': model,
+              'model': '$OLLAMA_MODEL',
               'messages': [
-                  {'role': 'system', 'content': system},
-                  {'role': 'user', 'content': prompt}
+                  {
+                      'role': 'system',
+                      'content': 'You fix code vulnerabilities. Reply with ONLY the fixed code. No explanation. No markdown. Just the corrected code.'
+                  },
+                  {
+                      'role': 'user',
+                      'content': open('$PROMPT_FILE').read()
+                  }
               ],
               'stream': False,
-              'options': {'temperature': 0.2, 'num_ctx': 2048}
+              'options': {'temperature': 0.1, 'num_ctx': 2048}
           }
-          with open('/tmp/ollama_request.json', 'w') as f:
+          with open('/tmp/ollama_req.json', 'w') as f:
               json.dump(req, f)
-          " "$FINDING_FILE" "$SYSTEM_PROMPT" "$OLLAMA_MODEL"
+          "
 
-            # ── Call Ollama ────────────────────────────────
-            RAW_RESPONSE=$(curl -sS --max-time 120 \
+            RAW=$(curl -sS --max-time 60 \
               -X POST http://localhost:11434/api/chat \
               -H "Content-Type: application/json" \
-              -d @/tmp/ollama_request.json 2>&1)
+              -d @/tmp/ollama_req.json 2>&1)
 
-            CURL_EXIT=$?
-
-            if [ $CURL_EXIT -ne 0 ]; then
-              echo "       ✘ Curl failed (exit code: ${CURL_EXIT})"
-              FAILED=$((FAILED + 1))
-              continue
-            fi
-
-            # Debug: show first 300 chars of raw response
-            echo "       DEBUG: $(echo "$RAW_RESPONSE" | head -c 300)"
-
-            # ── Parse response ─────────────────────────────
-            AI_RESULT=$(echo "$RAW_RESPONSE" | python3 -c "
+            # Extract the content
+            FIXED_CODE=$(echo "$RAW" | python3 -c "
           import sys, json
           try:
               data = json.load(sys.stdin)
               if 'error' in data:
-                  print('ERROR: ' + data['error'])
+                  print('')
                   sys.exit(0)
               c = data.get('message', {}).get('content', '').strip()
               # Strip markdown fences
-              if c.startswith('\`\`\`'):
-                  c = c.split('\n', 1)[-1]
-              if c.endswith('\`\`\`'):
-                  c = c.rsplit('\`\`\`', 1)[0]
-              # Try to find JSON in the response
-              c = c.strip()
-              if not c.startswith('{'):
-                  # Maybe JSON is embedded in text
-                  start = c.find('{')
-                  end = c.rfind('}')
-                  if start != -1 and end != -1:
-                      c = c[start:end+1]
-              print(c)
-          except Exception as e:
-              print('PARSE_ERROR: ' + str(e))
+              lines = c.split('\n')
+              clean = []
+              in_fence = False
+              for line in lines:
+                  stripped = line.strip()
+                  if stripped.startswith('\`\`\`'):
+                      in_fence = not in_fence
+                      continue
+                  if in_fence or not stripped.startswith('\`\`\`'):
+                      clean.append(line)
+              result = '\n'.join(clean).strip()
+              if result:
+                  print(result)
+              else:
+                  print(c)
+          except:
+              print('')
           " 2>/dev/null)
 
-            echo "       AI says: $(echo "$AI_RESULT" | head -c 200)"
-
-            # Check for errors
-            if [ -z "$AI_RESULT" ] || echo "$AI_RESULT" | grep -q "^ERROR:" || echo "$AI_RESULT" | grep -q "^PARSE_ERROR:"; then
-              echo "       ✘ AI failed: ${AI_RESULT}"
+            if [ -z "$FIXED_CODE" ]; then
+              echo "       ✘ No response from AI"
               FAILED=$((FAILED + 1))
+              echo ""
               continue
             fi
 
-            # ── Parse JSON fields ──────────────────────────
-            IS_FP=$(echo "$AI_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('is_false_positive', ''))" 2>/dev/null)
-            CONFIDENCE=$(echo "$AI_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('confidence', 'LOW'))" 2>/dev/null)
-            REASONING=$(echo "$AI_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('reasoning', ''))" 2>/dev/null)
-            FIX=$(echo "$AI_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('suggested_fix', '') or '')" 2>/dev/null)
-            CODE=$(echo "$AI_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('fixed_code', '') or '')" 2>/dev/null)
+            echo "       ✔ Fix received ($(echo "$FIXED_CODE" | wc -l | tr -d ' ') lines)"
 
-            if [ -z "$IS_FP" ]; then
-              echo "       ✘ Could not parse AI JSON"
+            # ── Check if the fix is different from original ─
+            if [ "$FIXED_CODE" = "$VULN_CODE" ]; then
+              echo "       ⚠ Fix is same as original — skipping"
               FAILED=$((FAILED + 1))
+              echo ""
               continue
             fi
 
-            # ── False Positive ─────────────────────────────
-            if [ "$IS_FP" = "True" ]; then
-              FALSE_POS=$((FALSE_POS + 1))
-              echo "       🟢 FALSE POSITIVE (${CONFIDENCE})"
-              echo "       ${REASONING}"
-
-              PR_NUMBER="${{ github.event.pull_request.number }}"
-              if [ -n "$PR_NUMBER" ]; then
-                curl -sS -o /dev/null -X POST \
-                  -H "Authorization: token ${GITHUB_TOKEN}" \
-                  -H "Accept: application/vnd.github.v3+json" \
-                  "https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-                  -d "$(python3 -c "
-          import json, sys
-          body = '🟢 **AI Triage — Likely False Positive**\n\n'
-          body += '| | |\n|---|---|\n'
-          body += '| **Rule** | \`' + sys.argv[1] + '\` |\n'
-          body += '| **File** | \`' + sys.argv[2] + '\` |\n'
-          body += '| **Confidence** | ' + sys.argv[3] + ' |\n\n'
-          body += '**Reasoning:** ' + sys.argv[4] + '\n\n'
-          body += '---\n_🤖 qwen2.5-coder:1.5b | Automated triage_'
-          print(json.dumps({'body': body}))
-          " "$RULE" "$FILE_PATH" "$CONFIDENCE" "$REASONING")" 2>/dev/null
-              fi
-              continue
-            fi
-
-            # ── True Positive ──────────────────────────────
             TRUE_POS=$((TRUE_POS + 1))
-            echo "       🔴 TRUE POSITIVE — creating fix"
-            echo "       ${REASONING}"
-            [ -n "$FIX" ] && echo "       Fix: ${FIX}"
 
-            if [ -z "$CODE" ] || [ "$CODE" = "None" ] || [ "$CODE" = "null" ]; then
-              echo "       ⚠ No fixed code — posting comment only"
-              continue
-            fi
-
-            SHORT_RULE=$(echo "$RULE" | awk -F'.' '{print $(NF-1)"."$NF}' | sed 's/[^a-zA-Z0-9.-]/-/g')
+            # ── Create branch and apply fix ────────────────
             BRANCH_NAME="fix/sast-${SHORT_RULE}-${IDX}"
             echo "       Branch: ${BRANCH_NAME}"
 
             git checkout main 2>/dev/null
             git checkout -b "$BRANCH_NAME" 2>/dev/null
 
+            # Apply fix to file
             python3 -c "
           import json, sys
 
-          with open(sys.argv[1]) as f:
+          with open('$META_FILE') as f:
               meta = json.load(f)
 
-          ai = json.loads(sys.argv[2])
-          fixed = ai.get('fixed_code', '')
-
-          if not fixed or fixed in ('null', 'None', ''):
-              sys.exit(1)
+          fixed_code = '''$FIXED_CODE'''
 
           with open(meta['file']) as f:
               lines = f.readlines()
@@ -314,59 +255,58 @@ jobs:
           start = meta['start_line'] - 1
           end = meta['end_line']
 
-          if not fixed.endswith('\n'):
-              fixed += '\n'
+          if not fixed_code.endswith('\n'):
+              fixed_code += '\n'
 
-          new_lines = lines[:start] + [fixed] + lines[end:]
+          new_lines = lines[:start] + [fixed_code] + lines[end:]
 
           with open(meta['file'], 'w') as f:
               f.writelines(new_lines)
-
-          print(f'Patched {meta[\"file\"]} lines {meta[\"start_line\"]}-{meta[\"end_line\"]}')
-          " "$META_FILE" "$AI_RESULT" 2>/dev/null
-
-            if [ $? -ne 0 ]; then
-              echo "       ⚠ Failed to apply patch"
-              git checkout main 2>/dev/null
-              continue
-            fi
+          " 2>/dev/null
 
             if git diff --quiet; then
-              echo "       ⚠ No changes after patch — skipping"
+              echo "       ⚠ No diff — skipping"
               git checkout main 2>/dev/null
+              echo ""
               continue
             fi
 
             git add "$FILE_PATH"
             git commit -m "fix: resolve ${SHORT_RULE} in ${FILE_PATH}
 
-          Severity: ${SEVERITY}
           Rule: ${RULE}
-          Fix: ${FIX}
-
-          Auto-generated by AI Security Remediation (${OLLAMA_MODEL})" 2>/dev/null
+          Severity: ${SEVERITY}
+          Auto-generated by ${OLLAMA_MODEL}" 2>/dev/null
 
             git push origin "$BRANCH_NAME" --force 2>/dev/null
 
             if [ $? -ne 0 ]; then
-              echo "       ⚠ git push failed"
+              echo "       ⚠ git push failed — check PAT_TOKEN permissions"
               git checkout main 2>/dev/null
+              echo ""
               continue
             fi
+
+            # ── Create PR ──────────────────────────────────
+            PR_TITLE="🔒 Fix: ${SHORT_RULE} in ${FILE_PATH}"
+
+            python3 -c "
+          import json
+          pr = {
+              'title': '$PR_TITLE',
+              'body': '🔴 **AI Security Fix**\n\n**Rule:** \`$RULE\`\n**File:** \`$FILE_PATH\`\n**Severity:** $SEVERITY\n\n---\n⚠️ Review before merging.\n_🤖 $OLLAMA_MODEL_',
+              'head': '$BRANCH_NAME',
+              'base': 'main'
+          }
+          with open('/tmp/pr_body.json', 'w') as f:
+              json.dump(pr, f)
+          "
 
             PR_RESPONSE=$(curl -sS -X POST \
               -H "Authorization: token ${GITHUB_TOKEN}" \
               -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/${{ github.repository }}/pulls" \
-              -d "$(python3 -c "
-          import json, sys
-          print(json.dumps({
-              'title': '🔒 Security Fix: ' + sys.argv[1] + ' in ' + sys.argv[2],
-              'body': '🔴 **AI Security Fix**\n\n| | |\n|---|---|\n| **Rule** | \`' + sys.argv[1] + '\` |\n| **File** | \`' + sys.argv[2] + '\` |\n| **Severity** | ' + sys.argv[3] + ' |\n| **Confidence** | ' + sys.argv[4] + ' |\n\n**What was found:** ' + sys.argv[5] + '\n\n**What was changed:** ' + sys.argv[6] + '\n\n---\n⚠️ **Review carefully before merging.**\n_🤖 qwen2.5-coder:1.5b_',
-              'head': sys.argv[7],
-              'base': 'main'
-          }))
-          " "$RULE" "$FILE_PATH" "$SEVERITY" "$CONFIDENCE" "$REASONING" "$FIX" "$BRANCH_NAME")" 2>/dev/null)
+              -d @/tmp/pr_body.json 2>/dev/null)
 
             PR_URL=$(echo "$PR_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('html_url',''))" 2>/dev/null)
 
@@ -375,24 +315,18 @@ jobs:
               FIX_PRS="${FIX_PRS}\n  - ${PR_URL}"
             else
               echo "       ⚠ PR creation failed"
-              echo "$PR_RESPONSE" | python3 -c "
-          import sys,json
-          try:
-              d=json.load(sys.stdin)
-              print(f'       {d.get(\"message\",\"\")} {d.get(\"errors\",\"\")}')
-          except: pass" 2>/dev/null
+              echo "$PR_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'       {d.get(\"message\",\"\")}') " 2>/dev/null
             fi
 
             git checkout main 2>/dev/null
+            echo ""
           done
 
-          echo ""
           echo "════════════════════════════════════════════════"
           echo "  AI REMEDIATION SUMMARY"
           echo "════════════════════════════════════════════════"
           echo "  Total processed:  ${TOTAL}"
-          echo "  True positives:   ${TRUE_POS} (fix PRs created)"
-          echo "  False positives:  ${FALSE_POS} (flagged)"
+          echo "  Fixes created:    ${TRUE_POS}"
           echo "  AI failures:      ${FAILED}"
           echo "  Model:            ${OLLAMA_MODEL}"
           if [ -n "$FIX_PRS" ]; then
