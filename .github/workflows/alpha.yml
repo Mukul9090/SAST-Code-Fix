@@ -1,6 +1,6 @@
 name: AI Security Remediation
 
-on:  
+on: 
   push:
     branches: [ "main" ]
   pull_request:
@@ -61,10 +61,7 @@ jobs:
           echo "════════════════════════════════════════════════"
           echo "  AI SECURITY REMEDIATION"
           echo "  Model: ${OLLAMA_MODEL}"
-          echo "  Runner: $(hostname)"
-          echo "  $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "════════════════════════════════════════════════"
-          echo ""
 
           if [ ! -f semgrep-results.json ] || [ ! -s semgrep-results.json ]; then
             echo "▸ No Semgrep results found — skipping"
@@ -74,269 +71,101 @@ jobs:
           # ── Extract & deduplicate findings ───────────────
           python3 << 'PYEOF'
           import json, os
-
           os.makedirs('/tmp/findings', exist_ok=True)
-
           with open('semgrep-results.json') as f:
               data = json.load(f)
-
           results = data.get('results', [])
           seen = set()
           count = 0
-
           for r in results:
               severity = r.get('extra', {}).get('severity', '').upper()
-              if severity not in ('ERROR', 'WARNING'):
-                  continue
-
+              if severity not in ('ERROR', 'WARNING'): continue
               file_path = r.get('path', '')
               start_line = r.get('start', {}).get('line', 0)
               end_line = r.get('end', {}).get('line', 0)
               check_id = r.get('check_id', '')
-              message = r.get('extra', {}).get('message', '')
               lines = r.get('extra', {}).get('lines', '')
-
-              # Deduplicate by file + line range
               key = f"{file_path}:{start_line}-{end_line}"
-              if key in seen:
-                  continue
+              if key in seen: continue
               seen.add(key)
-
-              # Write ONLY the snippet, not the full file
               with open(f'/tmp/findings/finding_{count}.prompt', 'w') as out:
                   out.write(f"Fix this {check_id.split('.')[-1]} vulnerability:\n\n{lines}")
-
               with open(f'/tmp/findings/finding_{count}.meta', 'w') as meta:
-                  json.dump({
-                      'file': file_path,
-                      'start_line': start_line,
-                      'end_line': end_line,
-                      'severity': severity,
-                      'check_id': check_id,
-                      'message': message,
-                      'lines': lines
-                  }, meta)
-
+                  json.dump({'file': file_path, 'start_line': start_line, 'end_line': end_line, 
+                            'severity': severity, 'check_id': check_id, 'lines': lines}, meta)
               count += 1
-
-          print(f"Deduplicated: {len(results)} raw findings → {count} unique")
+          print(f"Deduplicated: {count} unique findings")
           PYEOF
-
-          FINDING_COUNT=$(ls /tmp/findings/finding_*.prompt 2>/dev/null | wc -l | tr -d ' ')
-          echo "▸ Processing ${FINDING_COUNT} unique findings"
-          echo ""
-
-          if [ "$FINDING_COUNT" = "0" ]; then
-            echo "✔ Nothing to remediate"
-            exit 0
-          fi
 
           git config user.name "AI Security Bot"
           git config user.email "security-bot@automated.fix"
 
-          TOTAL=0
-          TRUE_POS=0
-          FALSE_POS=0
-          FAILED=0
-          FIX_PRS=""
+          # Define Authenticated URL for pushing
+          # This bypasses the runner's local credential store
+          AUTH_REPO="https://x-access-token:${GITHUB_TOKEN}@github.com/Mukul9090/SAST-Code-Fix.git"
 
           for PROMPT_FILE in /tmp/findings/finding_*.prompt; do
             [ -f "$PROMPT_FILE" ] || continue
-
             IDX=$(basename "$PROMPT_FILE" .prompt | sed 's/finding_//')
             META_FILE="/tmp/findings/finding_${IDX}.meta"
-
-            RULE=$(python3 -c "import json; print(json.load(open('$META_FILE'))['check_id'])")
             FILE_PATH=$(python3 -c "import json; print(json.load(open('$META_FILE'))['file'])")
-            SEVERITY=$(python3 -c "import json; print(json.load(open('$META_FILE'))['severity'])")
-            VULN_CODE=$(python3 -c "import json; print(json.load(open('$META_FILE'))['lines'])")
-            SHORT_RULE=$(echo "$RULE" | awk -F'.' '{print $NF}')
+            SHORT_RULE=$(python3 -c "import json; print(json.load(open('$META_FILE'))['check_id'].split('.')[-1])")
 
-            TOTAL=$((TOTAL + 1))
-            echo "  [${TOTAL}/${FINDING_COUNT}] ${SEVERITY} — ${SHORT_RULE}"
-            echo "       File: ${FILE_PATH}"
+            echo "▸ Processing: ${SHORT_RULE} in ${FILE_PATH}"
 
-            # ── Call Ollama with simple prompt ─────────────
-            PROMPT=$(cat "$PROMPT_FILE")
-
+            # ── Call Ollama ────────────────────────────────
             python3 -c "
           import json
-          req = {
-              'model': '$OLLAMA_MODEL',
-              'messages': [
-                  {
-                      'role': 'system',
-                      'content': 'You fix code vulnerabilities. Reply with ONLY the fixed code. No explanation. No markdown. Just the corrected code.'
-                  },
-                  {
-                      'role': 'user',
-                      'content': open('$PROMPT_FILE').read()
-                  }
-              ],
-              'stream': False,
-              'options': {'temperature': 0.1, 'num_ctx': 2048}
-          }
-          with open('/tmp/ollama_req.json', 'w') as f:
-              json.dump(req, f)
-          "
+          req = {'model': '$OLLAMA_MODEL', 'messages': [
+              {'role': 'system', 'content': 'You fix code vulnerabilities. Reply with ONLY the fixed code. No explanation. No markdown.'},
+              {'role': 'user', 'content': open('$PROMPT_FILE').read()}
+          ], 'stream': False}
+          with open('/tmp/req.json', 'w') as f: json.dump(req, f)"
 
-            RAW=$(curl -sS --max-time 60 \
-              -X POST http://localhost:11434/api/chat \
-              -H "Content-Type: application/json" \
-              -d @/tmp/ollama_req.json 2>&1)
+            RAW=$(curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" -d @/tmp/req.json)
+            FIXED_CODE=$(echo "$RAW" | python3 -c "import sys, json; print(json.load(sys.stdin).get('message', {}).get('content', '').strip())")
 
-            # Extract the content
-            FIXED_CODE=$(echo "$RAW" | python3 -c "
-          import sys, json
-          try:
-              data = json.load(sys.stdin)
-              if 'error' in data:
-                  print('')
-                  sys.exit(0)
-              c = data.get('message', {}).get('content', '').strip()
-              # Strip markdown fences
-              lines = c.split('\n')
-              clean = []
-              in_fence = False
-              for line in lines:
-                  stripped = line.strip()
-                  if stripped.startswith('\`\`\`'):
-                      in_fence = not in_fence
-                      continue
-                  if in_fence or not stripped.startswith('\`\`\`'):
-                      clean.append(line)
-              result = '\n'.join(clean).strip()
-              if result:
-                  print(result)
-              else:
-                  print(c)
-          except:
-              print('')
-          " 2>/dev/null)
+            if [ -z "$FIXED_CODE" ]; then echo "  ✘ AI failed"; continue; fi
 
-            if [ -z "$FIXED_CODE" ]; then
-              echo "       ✘ No response from AI"
-              FAILED=$((FAILED + 1))
-              echo ""
-              continue
-            fi
-
-            echo "       ✔ Fix received ($(echo "$FIXED_CODE" | wc -l | tr -d ' ') lines)"
-
-            # ── Check if the fix is different from original ─
-            if [ "$FIXED_CODE" = "$VULN_CODE" ]; then
-              echo "       ⚠ Fix is same as original — skipping"
-              FAILED=$((FAILED + 1))
-              echo ""
-              continue
-            fi
-
-            TRUE_POS=$((TRUE_POS + 1))
-
-            # ── Create branch and apply fix ────────────────
+            # ── Apply Fix & Create Branch ──────────────────
             BRANCH_NAME="fix/sast-${SHORT_RULE}-${IDX}"
-            echo "       Branch: ${BRANCH_NAME}"
-
             git checkout main 2>/dev/null
             git checkout -b "$BRANCH_NAME" 2>/dev/null
 
-            # Apply fix to file
-            python3 -c "
-          import json, sys
-
-          with open('$META_FILE') as f:
-              meta = json.load(f)
-
-          fixed_code = '''$FIXED_CODE'''
-
-          with open(meta['file']) as f:
-              lines = f.readlines()
-
-          start = meta['start_line'] - 1
-          end = meta['end_line']
-
-          if not fixed_code.endswith('\n'):
-              fixed_code += '\n'
-
-          new_lines = lines[:start] + [fixed_code] + lines[end:]
-
-          with open(meta['file'], 'w') as f:
-              f.writelines(new_lines)
-          " 2>/dev/null
-
-            if git diff --quiet; then
-              echo "       ⚠ No diff — skipping"
-              git checkout main 2>/dev/null
-              echo ""
-              continue
-            fi
-
-            git add "$FILE_PATH"
-            git commit -m "fix: resolve ${SHORT_RULE} in ${FILE_PATH}
-
-          Rule: ${RULE}
-          Severity: ${SEVERITY}
-          Auto-generated by ${OLLAMA_MODEL}" 2>/dev/null
-
-            git push origin "$BRANCH_NAME" --force 2>/dev/null
-
-            if [ $? -ne 0 ]; then
-              echo "       ⚠ git push failed — check PAT_TOKEN permissions"
-              git checkout main 2>/dev/null
-              echo ""
-              continue
-            fi
-
-            # ── Create PR ──────────────────────────────────
-            PR_TITLE="🔒 Fix: ${SHORT_RULE} in ${FILE_PATH}"
-
             python3 -c "
           import json
-          pr = {
-              'title': '$PR_TITLE',
-              'body': '🔴 **AI Security Fix**\n\n**Rule:** \`$RULE\`\n**File:** \`$FILE_PATH\`\n**Severity:** $SEVERITY\n\n---\n⚠️ Review before merging.\n_🤖 $OLLAMA_MODEL_',
-              'head': '$BRANCH_NAME',
-              'base': 'main'
-          }
-          with open('/tmp/pr_body.json', 'w') as f:
-              json.dump(pr, f)
-          "
+          with open('$META_FILE') as f: meta = json.load(f)
+          fixed = '''$FIXED_CODE'''
+          with open(meta['file']) as f: lines = f.readlines()
+          new_lines = lines[:meta['start_line']-1] + [fixed + '\n'] + lines[meta['end_line']:]
+          with open(meta['file'], 'w') as f: f.writelines(new_lines)"
 
-            PR_RESPONSE=$(curl -sS -X POST \
-              -H "Authorization: token ${GITHUB_TOKEN}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${{ github.repository }}/pulls" \
-              -d @/tmp/pr_body.json 2>/dev/null)
+            git add "$FILE_PATH"
+            git commit -m "fix: resolve ${SHORT_RULE} in ${FILE_PATH}" 2>/dev/null
 
-            PR_URL=$(echo "$PR_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('html_url',''))" 2>/dev/null)
+            # ── Authenticated Push ─────────────────────────
+            echo "  ▸ Pushing branch ${BRANCH_NAME}..."
+            git push "$AUTH_REPO" "$BRANCH_NAME" --force
 
-            if [ -n "$PR_URL" ] && [ "$PR_URL" != "None" ] && [ "$PR_URL" != "" ]; then
-              echo "       ✔ PR created: ${PR_URL}"
-              FIX_PRS="${FIX_PRS}\n  - ${PR_URL}"
+            if [ $? -eq 0 ]; then
+              echo "  ✔ Push successful"
+              
+              # ── Create Pull Request ──────────────────────
+              PR_TITLE="🔒 AI Fix: ${SHORT_RULE}"
+              PR_BODY="{\"title\":\"$PR_TITLE\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"🤖 AI-generated fix for $SHORT_RULE.\"}"
+              
+              curl -s -X POST \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/Mukul9090/SAST-Code-Fix/pulls" \
+                -d "$PR_BODY" > /dev/null
             else
-              echo "       ⚠ PR creation failed"
-              echo "$PR_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'       {d.get(\"message\",\"\")}') " 2>/dev/null
+              echo "  ✘ Push failed - check token permissions"
             fi
-
+            
             git checkout main 2>/dev/null
-            echo ""
           done
-
-          echo "════════════════════════════════════════════════"
-          echo "  AI REMEDIATION SUMMARY"
-          echo "════════════════════════════════════════════════"
-          echo "  Total processed:  ${TOTAL}"
-          echo "  Fixes created:    ${TRUE_POS}"
-          echo "  AI failures:      ${FAILED}"
-          echo "  Model:            ${OLLAMA_MODEL}"
-          if [ -n "$FIX_PRS" ]; then
-            echo ""
-            echo "  Fix PRs:"
-            echo -e "$FIX_PRS"
-          fi
-          echo "════════════════════════════════════════════════"
 
       - name: Cleanup
         if: always()
-        run: |
-          pkill ollama 2>/dev/null || true
+        run: pkill ollama 2>/dev/null || true
