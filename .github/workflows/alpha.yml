@@ -9,7 +9,8 @@ jobs:
   security-remediation:
     runs-on: self-hosted
     env:
-      GITHUB_TOKEN: "YOUR_NEW_GITHUB_TOKEN_HERE" 
+      # PASTE YOUR ACTUAL NEW TOKEN HERE
+      GITHUB_TOKEN: "ghp_REPLACE_WITH_YOUR_ACTUAL_NEW_TOKEN" 
       OLLAMA_MODEL: "qwen2.5-coder:3b"
 
     steps:
@@ -33,12 +34,9 @@ jobs:
       - name: AI Remediation & Push
         run: |
           set +e
-          if [ ! -f semgrep-results.json ] || [ ! -s semgrep-results.json ]; then
-            echo "No vulnerabilities found."
-            exit 0
-          fi
+          if [ ! -f semgrep-results.json ]; then exit 0; fi
 
-          # 1. Deduplicate findings
+          # Deduplicate findings
           python3 << 'PYEOF'
           import json, os
           os.makedirs('/tmp/findings', exist_ok=True)
@@ -50,86 +48,57 @@ jobs:
           for r in results:
               file_path = r.get('path', '')
               start_line = r.get('start', {}).get('line', 0)
-              end_line = r.get('end', {}).get('line', 0)
-              lines = r.get('extra', {}).get('lines', '')
-              check_id = r.get('check_id', '').split('.')[-1]
               key = f"{file_path}:{start_line}"
               if key in seen: continue
               seen.add(key)
               with open(f'/tmp/findings/f_{count}.meta', 'w') as m:
-                  json.dump({'file': file_path, 'start': start_line, 'end': end_line, 'rule': check_id, 'lines': lines}, m)
+                  json.dump({'file': file_path, 'start': start_line, 'end': r.get('end', {}).get('line', 0), 'rule': r.get('check_id', '').split('.')[-1], 'lines': r.get('extra', {}).get('lines', '')}, m)
               count += 1
           PYEOF
 
-          # 2. Configure Git
           git config user.name "AI Security Bot"
           git config user.email "security-bot@automated.fix"
-          AUTH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/Mukul9090/SAST-Code-Fix.git"
-          git remote set-url origin "$AUTH_URL"
 
-          # 3. Process each finding
+          # PROCESS FINDINGS
           for META in /tmp/findings/f_*.meta; do
             [ -f "$META" ] || continue
             FILE=$(python3 -c "import json; print(json.load(open('$META'))['file'])")
             RULE=$(python3 -c "import json; print(json.load(open('$META'))['rule'])")
             LINES=$(python3 -c "import json; print(json.load(open('$META'))['lines'])")
-            
             BRANCH_NAME="fix/sast-${RULE}-$(date +%s)"
+            
             git checkout main
             git checkout -b "$BRANCH_NAME"
 
-            echo "▸ Requesting fix for $RULE in $FILE"
-
-            # Call Ollama and save to file
+            # Call Ollama
             curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" \
-              -d "{\"model\":\"$OLLAMA_MODEL\",\"messages\":[{\"role\":\"system\",\"content\":\"Fix this vulnerability. Return ONLY the corrected python code. No explanation. No markdown fences.\"},{\"role\":\"user\",\"content\":\"$LINES\"}],\"stream\":false}" \
+              -d "{\"model\":\"$OLLAMA_MODEL\",\"messages\":[{\"role\":\"system\",\"content\":\"Fix this vulnerability. Return ONLY code. No markdown.\"},{\"role\":\"user\",\"content\":\"$LINES\"}],\"stream\":false}" \
               | python3 -c "import sys, json; print(json.load(sys.stdin).get('message', {}).get('content', '').strip())" > /tmp/ai_fix.txt
 
-            # Exporting variables for Python
             export CURRENT_META="$META"
             export FIXED_CODE_FILE="/tmp/ai_fix.txt"
 
-            # 4. Applying fix with Python using proper environment exports
             python3 << 'PYEOF'
           import json, os
-          
-          meta_path = os.environ['CURRENT_META']
-          fix_path = os.environ['FIXED_CODE_FILE']
-          
-          with open(meta_path) as f:
-              m = json.load(f)
-          with open(fix_path) as f:
-              fixed_code = f.read()
-          with open(m['file']) as f:
-              lines = f.readlines()
-          
-          # Remove markdown backticks if AI included them
-          fixed_code = fixed_code.replace('```python', '').replace('```', '').strip()
-          
-          # Rebuild file: Original lines up to start + Fixed code + Original lines from end
+          with open(os.environ['CURRENT_META']) as f: m = json.load(f)
+          with open(os.environ['FIXED_CODE_FILE']) as f: fixed_code = f.read().replace('```python', '').replace('```', '').strip()
+          with open(m['file']) as f: lines = f.readlines()
           new_lines = lines[:m['start']-1] + [fixed_code + '\n'] + lines[m['end']:]
-          with open(m['file'], 'w') as f:
-              f.writelines(new_lines)
+          with open(m['file'], 'w') as f: f.writelines(new_lines)
           PYEOF
 
-            # 5. Push and Create PR
+            # THE CRITICAL PUSH FIX
             git add "$FILE"
-            if git commit -m "fix: resolve $RULE in $FILE"; then
-               echo "  ✔ Committing and Pushing..."
-               git push origin "$BRANCH_NAME" --force
+            if git commit -m "fix: resolve $RULE"; then
+               # Force authentication by using the token in the URL directly here
+               git push "https://x-access-token:${GITHUB_TOKEN}@github.com/Mukul9090/SAST-Code-Fix.git" "$BRANCH_NAME" --force
                
-               PR_BODY="{\"title\":\"🔒 AI Fix: $RULE\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"Automated security patch for $RULE in $FILE.\"}"
+               # Create PR
                curl -s -X POST \
                 -H "Authorization: token ${GITHUB_TOKEN}" \
                 -H "Accept: application/vnd.github.v3+json" \
                 https://api.github.com/repos/Mukul9090/SAST-Code-Fix/pulls \
-                -d "$PR_BODY"
-            else
-               echo "  ⚠ No changes to commit"
+                -d "{\"title\":\"🔒 AI Fix: $RULE\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"Automated fix.\"}"
             fi
             git checkout main
           done
-
-      - name: Cleanup
-        if: always()
-        run: pkill ollama || true
