@@ -53,7 +53,7 @@ jobs:
 
       - name: AI Remediation
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GITHUB_TOKEN: "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"
           OLLAMA_MODEL: "qwen2.5-coder:3b"
         run: |
           set +e
