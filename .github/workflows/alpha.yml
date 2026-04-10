@@ -1,171 +1,41 @@
-name: AI Security Remediation
+name: Token Permission Check
 
-on: 
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-  workflow_dispatch:
+on: workflow_dispatch
 
 jobs:
-  security-scan:
+  check-token:
     runs-on: self-hosted
+    env:
+      # Replace this with your actual PAT for the test
+      MY_TOKEN: "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"
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Run Semgrep SAST
+      - name: Query GitHub API for Token Scopes
         run: |
-          pip install semgrep || pip install semgrep --break-system-packages
-          semgrep --config auto --json --output semgrep-results.json . || true
-          echo "✔ Semgrep scan complete"
-
-      - name: Upload scan results
-        uses: actions/upload-artifact@v4
-        with:
-          name: semgrep-results
-          path: semgrep-results.json
-
-  ai-remediation:
-    runs-on: self-hosted
-    needs: security-scan
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download scan results
-        uses: actions/download-artifact@v4
-        with:
-          name: semgrep-results
-
-      - name: Start Ollama
-        run: |
-          pkill ollama 2>/dev/null || true
-          sleep 2
-          ollama serve &
-          sleep 3
-          for i in $(seq 1 30); do
-            curl -s http://localhost:11434/api/tags > /dev/null 2>&1 && break
-            [ "$i" = "30" ] && echo "✘ Ollama failed to start" && exit 1
-            sleep 1
-          done
-          echo "✔ Ollama server ready"
-          ollama pull qwen2.5-coder:3b
-          echo "✔ Model ready"
-
-      - name: AI Remediation
-        env:
-          GITHUB_TOKEN: "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"
-          OLLAMA_MODEL: "qwen2.5-coder:3b"
-        run: |
-          set +e
-
           echo "════════════════════════════════════════════════"
-          echo "  AI SECURITY REMEDIATION"
-          echo "  Model: ${OLLAMA_MODEL}"
+          echo "   TOKEN DIAGNOSTIC REPORT"
           echo "════════════════════════════════════════════════"
-
-          if [ ! -f semgrep-results.json ] || [ ! -s semgrep-results.json ]; then
-            echo "▸ No Semgrep results found — skipping"
-            exit 0
+          
+          # Call the API and capture headers to see scopes
+          RESPONSE=$(curl -sI -H "Authorization: token $MY_TOKEN" https://api.github.com/user)
+          
+          # Check if the token is even valid
+          HTTP_STATUS=$(echo "$RESPONSE" | grep "HTTP/" | awk '{print $2}')
+          
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "✘ ERROR: Token is INVALID or EXPIRED (Status: $HTTP_STATUS)"
+            exit 1
           fi
 
-          # ── Extract & deduplicate findings ───────────────
-          python3 << 'PYEOF'
-          import json, os
-          os.makedirs('/tmp/findings', exist_ok=True)
-          with open('semgrep-results.json') as f:
-              data = json.load(f)
-          results = data.get('results', [])
-          seen = set()
-          count = 0
-          for r in results:
-              severity = r.get('extra', {}).get('severity', '').upper()
-              if severity not in ('ERROR', 'WARNING'): continue
-              file_path = r.get('path', '')
-              start_line = r.get('start', {}).get('line', 0)
-              end_line = r.get('end', {}).get('line', 0)
-              check_id = r.get('check_id', '')
-              lines = r.get('extra', {}).get('lines', '')
-              key = f"{file_path}:{start_line}-{end_line}"
-              if key in seen: continue
-              seen.add(key)
-              with open(f'/tmp/findings/finding_{count}.prompt', 'w') as out:
-                  out.write(f"Fix this {check_id.split('.')[-1]} vulnerability:\n\n{lines}")
-              with open(f'/tmp/findings/finding_{count}.meta', 'w') as meta:
-                  json.dump({'file': file_path, 'start_line': start_line, 'end_line': end_line, 
-                            'severity': severity, 'check_id': check_id, 'lines': lines}, meta)
-              count += 1
-          print(f"Deduplicated: {count} unique findings")
-          PYEOF
+          # Extract the X-OAuth-Scopes header
+          SCOPES=$(echo "$RESPONSE" | grep -i "x-oauth-scopes" | cut -d':' -f2 | xargs)
+          
+          echo "✔ Token is VALID"
+          echo "▸ Active Scopes: [ $SCOPES ]"
+          echo ""
 
-          git config user.name "AI Security Bot"
-          git config user.email "security-bot@automated.fix"
-
-          # Define Authenticated URL for pushing
-          # This bypasses the runner's local credential store
-          AUTH_REPO="https://x-access-token:${GITHUB_TOKEN}@github.com/Mukul9090/SAST-Code-Fix.git"
-
-          for PROMPT_FILE in /tmp/findings/finding_*.prompt; do
-            [ -f "$PROMPT_FILE" ] || continue
-            IDX=$(basename "$PROMPT_FILE" .prompt | sed 's/finding_//')
-            META_FILE="/tmp/findings/finding_${IDX}.meta"
-            FILE_PATH=$(python3 -c "import json; print(json.load(open('$META_FILE'))['file'])")
-            SHORT_RULE=$(python3 -c "import json; print(json.load(open('$META_FILE'))['check_id'].split('.')[-1])")
-
-            echo "▸ Processing: ${SHORT_RULE} in ${FILE_PATH}"
-
-            # ── Call Ollama ────────────────────────────────
-            python3 -c "
-          import json
-          req = {'model': '$OLLAMA_MODEL', 'messages': [
-              {'role': 'system', 'content': 'You fix code vulnerabilities. Reply with ONLY the fixed code. No explanation. No markdown.'},
-              {'role': 'user', 'content': open('$PROMPT_FILE').read()}
-          ], 'stream': False}
-          with open('/tmp/req.json', 'w') as f: json.dump(req, f)"
-
-            RAW=$(curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" -d @/tmp/req.json)
-            FIXED_CODE=$(echo "$RAW" | python3 -c "import sys, json; print(json.load(sys.stdin).get('message', {}).get('content', '').strip())")
-
-            if [ -z "$FIXED_CODE" ]; then echo "  ✘ AI failed"; continue; fi
-
-            # ── Apply Fix & Create Branch ──────────────────
-            BRANCH_NAME="fix/sast-${SHORT_RULE}-${IDX}"
-            git checkout main 2>/dev/null
-            git checkout -b "$BRANCH_NAME" 2>/dev/null
-
-            python3 -c "
-          import json
-          with open('$META_FILE') as f: meta = json.load(f)
-          fixed = '''$FIXED_CODE'''
-          with open(meta['file']) as f: lines = f.readlines()
-          new_lines = lines[:meta['start_line']-1] + [fixed + '\n'] + lines[meta['end_line']:]
-          with open(meta['file'], 'w') as f: f.writelines(new_lines)"
-
-            git add "$FILE_PATH"
-            git commit -m "fix: resolve ${SHORT_RULE} in ${FILE_PATH}" 2>/dev/null
-
-            # ── Authenticated Push ─────────────────────────
-            echo "  ▸ Pushing branch ${BRANCH_NAME}..."
-            git push "$AUTH_REPO" "$BRANCH_NAME" --force
-
-            if [ $? -eq 0 ]; then
-              echo "  ✔ Push successful"
-              
-              # ── Create Pull Request ──────────────────────
-              PR_TITLE="🔒 AI Fix: ${SHORT_RULE}"
-              PR_BODY="{\"title\":\"$PR_TITLE\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"🤖 AI-generated fix for $SHORT_RULE.\"}"
-              
-              curl -s -X POST \
-                -H "Authorization: token ${GITHUB_TOKEN}" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/Mukul9090/SAST-Code-Fix/pulls" \
-                -d "$PR_BODY" > /dev/null
-            else
-              echo "  ✘ Push failed - check token permissions"
-            fi
-            
-            git checkout main 2>/dev/null
-          done
-
-      - name: Cleanup
-        if: always()
-        run: pkill ollama 2>/dev/null || true
+          if [[ $SCOPES == *"repo"* ]]; then
+            echo "✔ PERMISSION CHECK: 'repo' scope found. You HAVE push access."
+          else
+            echo "✘ PERMISSION CHECK: 'repo' scope MISSING. You cannot push code."
+          fi
+          echo "════════════════════════════════════════════════"
