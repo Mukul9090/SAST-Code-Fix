@@ -9,7 +9,7 @@ jobs:
   security-remediation:
     runs-on: self-hosted
     env:
-      GITHUB_TOKEN: "YOUR_NEW_GITHUB_TOKEN_HERE" # Ensure this is your fresh token
+      GITHUB_TOKEN: "YOUR_NEW_GITHUB_TOKEN_HERE" 
       OLLAMA_MODEL: "qwen2.5-coder:3b"
 
     steps:
@@ -80,38 +80,42 @@ jobs:
 
             echo "▸ Requesting fix for $RULE in $FILE"
 
-            # Call Ollama and save to a temporary file instead of a variable
+            # Call Ollama and save to file
             curl -s -X POST http://localhost:11434/api/chat -H "Content-Type: application/json" \
               -d "{\"model\":\"$OLLAMA_MODEL\",\"messages\":[{\"role\":\"system\",\"content\":\"Fix this vulnerability. Return ONLY the corrected python code. No explanation. No markdown fences.\"},{\"role\":\"user\",\"content\":\"$LINES\"}],\"stream\":false}" \
               | python3 -c "import sys, json; print(json.load(sys.stdin).get('message', {}).get('content', '').strip())" > /tmp/ai_fix.txt
 
-            # Export the fixed code to an environment variable to pass to Python safely
-            export FIXED_CODE_STR=$(cat /tmp/ai_fix.txt)
+            # Exporting variables for Python
+            export CURRENT_META="$META"
+            export FIXED_CODE_FILE="/tmp/ai_fix.txt"
 
-            # 4. The Fix: Pass the code via ENV to avoid shell quoting issues
+            # 4. Applying fix with Python using proper environment exports
             python3 << 'PYEOF'
           import json, os
-          fixed_code = os.environ.get('FIXED_CODE_STR', '')
-          meta_file = os.environ.get('META_FILE_PATH', '') # We'll set this below
           
-          with open(os.environ['CURRENT_META']) as f:
+          meta_path = os.environ['CURRENT_META']
+          fix_path = os.environ['FIXED_CODE_FILE']
+          
+          with open(meta_path) as f:
               m = json.load(f)
+          with open(fix_path) as f:
+              fixed_code = f.read()
           with open(m['file']) as f:
               lines = f.readlines()
           
-          # Clean up any potential markdown fences the AI might have added anyway
+          # Remove markdown backticks if AI included them
           fixed_code = fixed_code.replace('```python', '').replace('```', '').strip()
           
+          # Rebuild file: Original lines up to start + Fixed code + Original lines from end
           new_lines = lines[:m['start']-1] + [fixed_code + '\n'] + lines[m['end']:]
           with open(m['file'], 'w') as f:
               f.writelines(new_lines)
           PYEOF
-            env:
-              CURRENT_META: $META
 
             # 5. Push and Create PR
             git add "$FILE"
-            if git commit -m "fix: $RULE"; then
+            if git commit -m "fix: resolve $RULE in $FILE"; then
+               echo "  ✔ Committing and Pushing..."
                git push origin "$BRANCH_NAME" --force
                
                PR_BODY="{\"title\":\"🔒 AI Fix: $RULE\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\",\"body\":\"Automated security patch for $RULE in $FILE.\"}"
@@ -120,6 +124,8 @@ jobs:
                 -H "Accept: application/vnd.github.v3+json" \
                 https://api.github.com/repos/Mukul9090/SAST-Code-Fix/pulls \
                 -d "$PR_BODY"
+            else
+               echo "  ⚠ No changes to commit"
             fi
             git checkout main
           done
