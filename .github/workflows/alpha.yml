@@ -364,6 +364,6 @@ jobs:
           echo "════════════════════════════════════════════════"
 
       - name: Cleanup
-        if: always
+        if: always()
         run: |
           pkill ollama 2>/dev/null || true
